@@ -1,0 +1,7 @@
+source 'https://rubygems.org'
+
+gem 'rake'
+gem 'yaml'
+gem 'octokit' # For GitHub API
+gem 'git'
+# Add more gems as required for your workflow
