@@ -1,0 +1,283 @@
+
+apiVersion: tekton.dev/v1beta1
+kind: Pipeline
+metadata:
+  name: ruby-build-deploy
+  namespace: tekton-pipelines
+  labels:
+    app: ruby-pipeline
+spec:
+  description: Complete CI/CD pipeline for Ruby application
+  
+  params:
+  - name: git-url
+    type: string
+    description: Git repository URL
+  - name: git-revision
+    type: string
+    description: Git revision to build
+    default: main
+  - name: image-name
+    type: string
+    description: Container image name
+  - name: image-tag
+    type: string
+    description: Container image tag
+  - name: environment
+    type: string
+    description: Target environment (staging/production)
+    default: staging
+  - name: gitops-repo-url
+    type: string
+    description: GitOps repository URL
+  
+  workspaces:
+  - name: source
+    description: Source code workspace
+  - name: dockerconfig
+    description: Docker configuration for pushing images
+  - name: gitops
+    description: GitOps repository workspace
+  
+  tasks:
+  
+  # 1. Fetch source code
+  - name: fetch-source
+    taskRef:
+      name: git-clone
+      kind: ClusterTask
+    workspaces:
+    - name: output
+      workspace: source
+    params:
+    - name: url
+      value: $(params.git-url)
+    - name: revision
+      value: $(params.git-revision)
+    - name: deleteExisting
+      value: "true"
+  
+  # 2. Install dependencies
+  - name: install-dependencies
+    taskRef:
+      name: ruby-bundle-install
+    runAfter:
+    - fetch-source
+    workspaces:
+    - name: source
+      workspace: source
+  
+  # 3. Run unit tests
+  - name: run-tests
+    taskRef:
+      name: ruby-test
+    runAfter:
+    - install-dependencies
+    workspaces:
+    - name: source
+      workspace: source
+    params:
+    - name: test-command
+      value: "bundle exec rspec --format RspecJunitFormatter --out test-results.xml"
+  
+  # 4. Security scan
+  - name: security-scan
+    taskRef:
+      name: ruby-security-scan
+    runAfter:
+    - install-dependencies
+    workspaces:
+    - name: source
+      workspace: source
+  
+  # 5. Code quality check
+  - name: code-quality
+    taskRef:
+      name: ruby-lint
+    runAfter:
+    - install-dependencies
+    workspaces:
+    - name: source
+      workspace: source
+  
+  # 6. Build container image
+  - name: build-image
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    runAfter:
+    - run-tests
+    - security-scan
+    - code-quality
+    workspaces:
+    - name: source
+      workspace: source
+    - name: dockerconfig
+      workspace: dockerconfig
+    params:
+    - name: IMAGE
+      value: $(params.image-name):$(params.image-tag)
+    - name: DOCKERFILE
+      value: ./Dockerfile
+    - name: CONTEXT
+      value: .
+    - name: FORMAT
+      value: docker
+  
+  # 7. Container security scan
+  - name: scan-image
+    taskRef:
+      name: trivy-scanner
+    runAfter:
+    - build-image
+    params:
+    - name: IMAGE_URL
+      value: $(params.image-name):$(params.image-tag)
+    - name: SEVERITY_LEVELS
+      value: "CRITICAL,HIGH"
+  
+  # 8. Push image to registry
+  - name: push-image
+    taskRef:
+      name: buildah
+      kind: ClusterTask
+    runAfter:
+    - scan-image
+    workspaces:
+    - name: source
+      workspace: source
+    - name: dockerconfig
+      workspace: dockerconfig
+    params:
+    - name: IMAGE
+      value: $(params.image-name):$(params.image-tag)
+    - name: DOCKERFILE
+      value: ./Dockerfile
+    - name: CONTEXT
+      value: .
+    - name: FORMAT
+      value: docker
+    - name: SKIP_BUILD
+      value: "true"
+  
+  # 9. Update GitOps repository
+  - name: update-gitops
+    taskRef:
+      name: update-gitops-repo
+    runAfter:
+    - push-image
+    workspaces:
+    - name: gitops
+      workspace: gitops
+    params:
+    - name: gitops-repo-url
+      value: $(params.gitops-repo-url)
+    - name: image-name
+      value: $(params.image-name)
+    - name: image-tag
+      value: $(params.image-tag)
+    - name: environment
+      value: $(params.environment)
+    - name: app-name
+      value: ruby-app
+  
+  # 10. Deploy to staging (if staging environment)
+  - name: deploy-staging
+    taskRef:
+      name: argocd-sync
+    when:
+    - input: "$(params.environment)"
+      operator: in
+      values: ["staging"]
+    runAfter:
+    - update-gitops
+    params:
+    - name: application-name
+      value: ruby-app-staging
+    - name: sync-timeout
+      value: "300"
+  
+  # 11. Run integration tests (staging only)
+  - name: integration-tests
+    taskRef:
+      name: integration-test
+    when:
+    - input: "$(params.environment)"
+      operator: in
+      values: ["staging"]
+    runAfter:
+    - deploy-staging
+    params:
+    - name: app-url
+      value: "https://staging.ruby-app.buildwithsushant.com"
+    - name: test-suite
+      value: "integration"
+  
+  # 12. Performance tests (staging only)
+  - name: performance-tests
+    taskRef:
+      name: performance-test
+    when:
+    - input: "$(params.environment)"
+      operator: in
+      values: ["staging"]
+    runAfter:
+    - integration-tests
+    params:
+    - name: app-url
+      value: "https://staging.ruby-app.buildwithsushant.com"
+    - name: duration
+      value: "5m"
+    - name: concurrent-users
+      value: "10"
+  
+  # 13. Deploy to production (manual approval required)
+  - name: deploy-production
+    taskRef:
+      name: argocd-sync
+    when:
+    - input: "$(params.environment)"
+      operator: in
+      values: ["production"]
+    runAfter:
+    - update-gitops
+    params:
+    - name: application-name
+      value: ruby-app-production
+    - name: sync-timeout
+      value: "600"
+  
+  # 14. Post-deployment smoke tests
+  - name: smoke-tests
+    taskRef:
+      name: smoke-test
+    runAfter:
+    - deploy-staging
+    - deploy-production
+    params:
+    - name: app-url
+      value: "https://$(params.environment).ruby-app.buildwithsushant.com"
+    - name: health-endpoint
+      value: "/health"
+    - name: timeout
+      value: "60"
+
+  finally:
+  # Cleanup and notifications
+  - name: cleanup
+    taskRef:
+      name: cleanup-workspace
+    workspaces:
+    - name: source
+      workspace: source
+  
+  - name: notify-slack
+    taskRef:
+      name: send-slack-notification
+    params:
+    - name: webhook-url
+      value: "$(workspaces.source.path)/slack-webhook"
+    - name: message
+      value: "Pipeline $(context.pipelineRun.name) completed for $(params.git-revision)"
+    - name: status
+      value: "$(tasks.status)"
